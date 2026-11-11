@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Map to DXF 2D/3D Exporter</title>
+  
+  <!-- Leaflet CSS & JS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  
+  <!-- Leaflet Draw CSS & JS -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+  
+  <!-- Three.js (Pour la prévisualisation 3D) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    body { display: flex; height: 100vh; overflow: hidden; background: #1a1a1a; color: #fff; }
+    
+    #sidebar {
+      width: 360px;
+      background: #252526;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+      z-index: 1000;
+      box-shadow: 2px 0 10px rgba(0,0,0,0.5);
+    }
+    
+    h2 { font-size: 1.2rem; color: #007acc; border-bottom: 2px solid #007acc; padding-bottom: 5px; }
+    p { font-size: 0.85rem; color: #ccc; line-height: 1.4; }
+
+    .btn {
+      background: #007acc;
+      color: white;
+      border: none;
+      padding: 10px 15px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+      transition: background 0.2s;
+    }
+    .btn:hover { background: #005999; }
+    .btn:disabled { background: #555; cursor: not-allowed; }
+    .btn-success { background: #28a745; }
+    .btn-success:hover { background: #218838; }
+
+    #map-container { flex: 1; position: relative; height: 100%; }
+    #map { width: 100%; height: 50%; }
+    #viewer3d { width: 100%; height: 50%; background: #111; position: relative; }
+    #viewer3d-label { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); padding: 5px 10px; border-radius: 4px; font-size: 0.8rem; z-index: 10; }
+
+    #status { font-size: 0.85rem; padding: 10px; background: #333; border-radius: 4px; border-left: 4px solid #007acc; }
+  </style>
+</head>
+<body>
+
+  <div id="sidebar">
+    <h2>Map to DXF (2D & 3D)</h2>
+    <p>1. Utilisez l'outil de sélection rectangle sur la carte pour définir votre zone.<br>
+       2. Cliquez sur "Charger les données OSM".<br>
+       3. Exportez en DXF (compatible AutoCAD / DWG).</p>
+
+    <button id="btn-fetch" class="btn" disabled>1. Charger les données OSM</button>
+    <button id="btn-dxf-2d" class="btn btn-success" disabled>2. Exporter DXF 2D</button>
+    <button id="btn-dxf-3d" class="btn btn-success" disabled>3. Exporter DXF 3D</button>
+
+    <div id="status">En attente de la sélection d'une zone...</div>
+  </div>
+
+  <div id="map-container">
+    <div id="map"></div>
+    <div id="viewer3d">
+      <div id="viewer3d-label">Aperçu 3D Temps Réel</div>
+    </div>
+  </div>
+
+  <script>
+    // --- 1. CONFIGURATION CARTE (LEAFLET) ---
+    const map = L.map('map').setView([48.8566, 2.3522], 16); // Paris par défaut
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    const drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+
+    const drawControl = new L.Control.Draw({
+      draw: {
+        polyline: false, polygon: false, circle: false, marker: false, circlemarker: false,
+        rectangle: { shapeOptions: { color: '#007acc', weight: 2 } }
+      },
+      edit: { featureGroup: drawnItems, remove: true }
+    });
+    map.addControl(drawControl);
+
+    let currentBbox = null;
+    let osmData = null;
+
+    map.on(L.Draw.Event.CREATED, function (e) {
+      drawnItems.clearLayers();
+      const layer = e.layer;
+      drawnItems.addLayer(layer);
+      const bounds = layer.getBounds();
+      currentBbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+      
+      document.getElementById('btn-fetch').disabled = false;
+      setStatus("Zone sélectionnée. Cliquez sur 'Charger les données'.");
+    });
+
+    function setStatus(msg) {
+      document.getElementById('status').innerText = msg;
+    }
+
+    // --- 2. RECUPERATION DES DONNEES OVERPASS API ---
+    document.getElementById('btn-fetch').addEventListener('click', async () => {
+      if (!currentBbox) return;
+      setStatus("Téléchargement des données OpenStreetMap en cours...");
+      
+      const query = `
+        [out:json][timeout:25];
+        (
+          way["building"](${currentBbox});
+          relation["building"](${currentBbox});
+          way["highway"](${currentBbox});
+          way["landuse"="grass"](${currentBbox});
+          way["leisure"="park"](${currentBbox});
+        );
+        out body;
+        >;
+        out skel qt;
+      `;
+
+      try {
+        const response = await fetch('https://overpass-api.de/api/interpreter', {
+          method: 'POST',
+          body: query
+        });
+        osmData = await response.json();
+        setStatus(`Données chargées ! (${osmData.elements.length} éléments reçus).`);
+        
+        document.getElementById('btn-dxf-2d').disabled = false;
+        document.getElementById('btn-dxf-3d').disabled = false;
+
+        render3D(osmData);
+      } catch (err) {
+        setStatus("Erreur lors de la récupération des données OSM.");
+        console.error(err);
+      }
+    });
+
+    // --- 3. RENDU 3D TEMPS REEL (THREE.JS) ---
+    let scene, camera, renderer, controls;
+    function init3D() {
+      const container = document.getElementById('viewer3d');
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x111111);
+
+      camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 1, 5000);
+      camera.position.set(0, -300, 300);
+      camera.up.set(0, 0, 1);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      container.appendChild(renderer.domElement);
+
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+      
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+      scene.add(ambientLight);
+
+      const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      dirLight.position.set(200, -400, 500);
+      scene.add(dirLight);
+
+      function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+      }
+      animate();
+    }
+    init3D();
+
+    function render3D(data) {
+      // Nettoyer la scène précédente
+      while(scene.children.length > 0){ scene.remove(scene.children[0]); }
+      
+      const nodes = {};
+      data.elements.filter(e => e.type === 'node').forEach(n => {
+        nodes[n.id] = [n.lon, n.lat];
+      });
+
+      // Calculer le centre local (Origine 0,0,0)
+      const centerLonLat = getCenter(nodes);
+      
+      data.elements.filter(e => e.type === 'way' && e.tags && e.tags.building).forEach(way => {
+        const coords = way.nodes.map(id => nodes[id]).filter(Boolean);
+        if (coords.length < 3) return;
+
+        // Calcul hauteur
+        let height = 10;
+        if (way.tags.height) height = parseFloat(way.tags.height);
+        else if (way.tags['building:levels']) height = parseFloat(way.tags['building:levels']) * 3;
+
+        // Forme 2D projetée en mètres
+        const shape = new THREE.Shape();
+        coords.forEach((c, i) => {
+          const p = lonLatToMeters(c[0], c[1], centerLonLat);
+          if (i === 0) shape.moveTo(p.x, p.y);
+          else shape.lineTo(p.x, p.y);
+        });
+
+        const geometry = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false });
+        const material = new THREE.MeshLambertMaterial({ color: 0x007acc, wireframe: false });
+        const mesh = new THREE.Mesh(geometry, material);
+        scene.add(mesh);
+      });
+    }
+
+    // --- 4. EXPORTATEUR DXF 2D / 3D ---
+    document.getElementById('btn-dxf-2d').addEventListener('click', () => generateDXF(false));
+    document.getElementById('btn-dxf-3d').addEventListener('click', () => generateDXF(true));
+
+    function generateDXF(is3D) {
+      if (!osmData) return;
+
+      const nodes = {};
+      osmData.elements.filter(e => e.type === 'node').forEach(n => {
+        nodes[n.id] = [n.lon, n.lat];
+      });
+      const center = getCenter(nodes);
+
+      let dxf = `0\nSECTION\n2\nHEADER\n0\nENDSEC\n`;
+      dxf += `0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLAYER\n`;
+      
+      // Def Layers
+      const layers = ["BATIMENTS", "VOIRIE", "ESPACES_VERTS"];
+      layers.forEach(l => {
+        dxf += `0\nLAYER\n2\n${l}\n70\n0\n62\n7\n6\nCONTINUOUS\n`;
+      });
+      dxf += `0\nENDTAB\n0\nENDSEC\n`;
+      
+      dxf += `0\nSECTION\n2\nENTITIES\n`;
+
+      osmData.elements.filter(e => e.type === 'way').forEach(way => {
+        const coords = way.nodes.map(id => nodes[id]).filter(Boolean);
+        if (coords.length < 2) return;
+
+        let layerName = "VOIRIE";
+        if (way.tags) {
+          if (way.tags.building) layerName = "BATIMENTS";
+          else if (way.tags.landuse === "grass" || way.tags.leisure === "park") layerName = "ESPACES_VERTS";
+        }
+
+        const pts = coords.map(c => lonLatToMeters(c[0], c[1], center));
+        let height = 0;
+        if (is3D && way.tags && way.tags.building) {
+          if (way.tags.height) height = parseFloat(way.tags.height);
+          else if (way.tags['building:levels']) height = parseFloat(way.tags['building:levels']) * 3;
+          else height = 9;
+        }
+
+        // Ecrire Polyline 2D ou Faces 3D
+        if (!is3D || height === 0) {
+          dxf += `0\nLWPOLYLINE\n100\nAcDbEntity\n8\n${layerName}\n100\nAcDbPolyline\n90\n${pts.length}\n70\n${way.tags && way.tags.building ? 1 : 0}\n`;
+          pts.forEach(p => {
+            dxf += `10\n${p.x.toFixed(3)}\n20\n${p.y.toFixed(3)}\n`;
+          });
+        } else {
+          // Extrusion 3D (3DFACE pour chaque mur)
+          for (let i = 0; i < pts.length - 1; i++) {
+            const p1 = pts[i], p2 = pts[i+1];
+            dxf += create3DFace(p1.x, p1.y, 0,  p2.x, p2.y, 0,  p2.x, p2.y, height,  p1.x, p1.y, height, layerName);
+          }
+          // Toit
+          for (let i = 1; i < pts.length - 1; i++) {
+            dxf += create3DFace(pts[0].x, pts[0].y, height,  pts[i].x, pts[i].y, height,  pts[i+1].x, pts[i+1].y, height,  pts[i+1].x, pts[i+1].y, height, layerName);
+          }
+        }
+      });
+
+      dxf += `0\nENDSEC\n0\nEOF\n`;
+
+      // Téléchargement
+      const blob = new Blob([dxf], { type: 'application/dxf' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `export_carte_${is3D ? '3D' : '2D'}.dxf`;
+      link.click();
+    }
+
+    function create3DFace(x1,y1,z1, x2,y2,z2, x3,y3,z3, x4,y4,z4, layer) {
+      return `0\n3DFACE\n8\n${layer}\n10\n${x1.toFixed(3)}\n20\n${y1.toFixed(3)}\n30\n${z1.toFixed(3)}\n11\n${x2.toFixed(3)}\n21\n${y2.toFixed(3)}\n31\n${z2.toFixed(3)}\n12\n${x3.toFixed(3)}\n22\n${y3.toFixed(3)}\n30\n${z3.toFixed(3)}\n13\n${x4.toFixed(3)}\n23\n${y4.toFixed(3)}\n33\n${z4.toFixed(3)}\n`;
+    }
+
+    // UTILS MATHS & PROJECTION
+    function getCenter(nodes) {
+      const keys = Object.keys(nodes);
+      let sumLon = 0, sumLat = 0;
+      keys.forEach(k => { sumLon += nodes[k][0]; sumLat += nodes[k][1]; });
+      return [sumLon / keys.length, sumLat / keys.length];
+    }
+
+    function lonLatToMeters(lon, lat, center) {
+      const R = 6378137; // Rayon terre
+      const dLat = (lat - center[1]) * Math.PI / 180;
+      const dLon = (lon - center[0]) * Math.PI / 180;
+      const x = dLon * R * Math.cos(center[1] * Math.PI / 180);
+      const y = dLat * R;
+      return { x, y };
+    }
+  </script>
+</body>
+</html>
