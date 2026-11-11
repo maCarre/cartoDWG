@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Map to DXF (2D/3D) - OSM & OpenData France</title>
+  <title>Map to DXF (2D/3D) - OSM, IGN BD TOPO & Cadastre</title>
   
   <!-- Leaflet CSS & JS -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
@@ -47,7 +47,7 @@
       gap: 10px;
     }
     .source-item { display: flex; align-items: flex-start; gap: 8px; }
-    .source-item input { margin-top: 3px; }
+    .source-item input { margin-top: 3px; cursor: pointer; }
 
     .btn {
       background: #007acc;
@@ -95,30 +95,37 @@
       border: 1px solid #007acc;
     }
 
-    #status { font-size: 0.85rem; padding: 10px; background: #1e1e1e; border-radius: 4px; border-left: 4px solid #007acc; }
+    #status { font-size: 0.85rem; padding: 10px; background: #1e1e1e; border-radius: 4px; border-left: 4px solid #007acc; line-height: 1.3; }
   </style>
 </head>
 <body>
 
   <div id="sidebar">
-    <h2>Map to DXF (Grenoble & Multi-Sources)</h2>
+    <h2>Map to DXF (Grenoble & OpenData)</h2>
     
     <div id="status">Tracez un rectangle de sélection sur la carte.</div>
 
-    <h3>Sources de Données Actives</h3>
+    <h3>Sources de Données Réseau</h3>
     <div class="source-list">
       <div class="source-item">
         <input type="checkbox" id="src-osm" checked>
         <div>
-          <strong>Option A : OpenStreetMap (Overpass)</strong><br>
-          <span style="font-size:0.75rem; color:#aaa;">Bâtiments (hauteurs), Voirie, Espaces verts (Mondial).</span>
+          <strong>OpenStreetMap (Overpass)</strong><br>
+          <span style="font-size:0.75rem; color:#aaa;">Bâtiments, Voirie, Espaces verts (Mondial).</span>
+        </div>
+      </div>
+      <div class="source-item">
+        <input type="checkbox" id="src-ign" checked>
+        <div>
+          <strong>IGN BD TOPO® (Géoplateforme)</strong><br>
+          <span style="font-size:0.75rem; color:#aaa;">Bâtiments haute précision & hauteurs IGN.</span>
         </div>
       </div>
       <div class="source-item">
         <input type="checkbox" id="src-cadastre" checked>
         <div>
-          <strong>Option B : Cadastre DGFIP / Etalab</strong><br>
-          <span style="font-size:0.75rem; color:#aaa;">Parcelles cadastrales officielles et limites d'îlots (France).</span>
+          <strong>Cadastre DGFIP (Etalab)</strong><br>
+          <span style="font-size:0.75rem; color:#aaa;">Limites parcellaires exactes.</span>
         </div>
       </div>
     </div>
@@ -160,6 +167,7 @@
 
     let currentBounds = null;
     let osmData = null;
+    let ignData = null;
     let cadastreData = null;
 
     map.on(L.Draw.Event.CREATED, function (e) {
@@ -193,10 +201,10 @@
       map.invalidateSize();
     });
 
-    // --- 2. RECUPERATION DES DONNEES (OSM + CADASTRE) ---
+    // --- 2. RECUPERATION DES DONNEES (OSM + IGN BD TOPO + CADASTRE) ---
     document.getElementById('btn-fetch').addEventListener('click', async () => {
       if (!currentBounds) return;
-      setStatus("Chargement des données réseau...");
+      setStatus("Chargement des données en cours...");
       
       const south = currentBounds.getSouth();
       const west = currentBounds.getWest();
@@ -205,53 +213,70 @@
       const bboxStr = `${south},${west},${north},${east}`;
 
       const useOSM = document.getElementById('src-osm').checked;
+      const useIGN = document.getElementById('src-ign').checked;
       const useCadastre = document.getElementById('src-cadastre').checked;
 
       osmData = null;
+      ignData = null;
       cadastreData = null;
 
-      try {
-        // Option A: OpenStreetMap Overpass
-        if (useOSM) {
-          const query = `
-            [out:json][timeout:25];
-            (
-              way["building"](${bboxStr});
-              relation["building"](${bboxStr});
-              way["highway"](${bboxStr});
-              way["landuse"="grass"](${bboxStr});
-              way["leisure"="park"](${bboxStr});
-            );
-            out body; >; out skel qt;
-          `;
-          const resOSM = await fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: query });
-          osmData = await resOSM.json();
-        }
+      let loadedSources = [];
 
-        // Option B: Cadastre DGFIP / Etalab (API GeoJSON)
-        if (useCadastre) {
+      // A. OpenStreetMap Overpass (avec gestion d'erreur 502/HTML)
+      if (useOSM) {
+        try {
+          const query = `[out:json][timeout:25];(way["building"](${bboxStr});way["highway"](${bboxStr});way["landuse"="grass"](${bboxStr}););out body;>;out skel qt;`;
+          const resOSM = await fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: query });
+          
+          if (resOSM.ok) {
+            osmData = await resOSM.json();
+            loadedSources.push(`OSM (${osmData.elements.length} élém.)`);
+          } else {
+            console.warn("Serveur Overpass surchargé (Code HTTP " + resOSM.status + ")");
+          }
+        } catch (e) {
+          console.warn("Erreur réseau Overpass API");
+        }
+      }
+
+      // B. IGN BD TOPO® (API WFS Géoplateforme)
+      if (useIGN) {
+        try {
+          const ignUrl = `https://data.geopf.fr/wfs/ows?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAME=BDTOPO_V3:batiment&SRSNAME=EPSG:4326&OUTPUTFORMAT=application/json&BBOX=${south},${west},${north},${east}`;
+          const resIGN = await fetch(ignUrl);
+          if (resIGN.ok) {
+            ignData = await resIGN.json();
+            if (ignData.features) loadedSources.push(`IGN BD TOPO (${ignData.features.length} bât.)`);
+          }
+        } catch (e) {
+          console.warn("Erreur API IGN WFS");
+        }
+      }
+
+      // C. Cadastre DGFIP / Etalab
+      if (useCadastre) {
+        try {
           const cadastreUrl = `https://cadastre.data.gouv.fr/api/v1/geojson/parcelles?bbox=${west},${south},${east},${north}`;
           const resCad = await fetch(cadastreUrl);
           if (resCad.ok) {
             cadastreData = await resCad.json();
+            if (cadastreData.features) loadedSources.push(`Cadastre (${cadastreData.features.length} parc.)`);
           }
+        } catch (e) {
+          console.warn("Erreur API Cadastre");
         }
+      }
 
-        let summary = "Données chargées : ";
-        if (osmData) summary += `${osmData.elements.length} éléments OSM. `;
-        if (cadastreData) summary += `${cadastreData.features.length} parcelles cadastrales.`;
-
-        setStatus(summary);
+      if (loadedSources.length > 0) {
+        setStatus("Données reçues : " + loadedSources.join(" | "));
         document.getElementById('btn-dxf-full').disabled = false;
-        
-        if (osmData) render3D(osmData);
-      } catch (err) {
-        setStatus("Erreur lors de la récupération des données.");
-        console.error(err);
+        render3DCombined();
+      } else {
+        setStatus("Aucune donnée récupérée. Le serveur Overpass est peut-être temporairement indisponible, réessayez ou cochez IGN BD TOPO.");
       }
     });
 
-    // --- 3. SCENE 3D AVEC ECLAIRED DENSE (THREE.JS) ---
+    // --- 3. SCENE 3D UNIFIÉE (THREE.JS) ---
     let scene, camera, renderer, controls;
     function init3D() {
       const container = document.getElementById('viewer3d');
@@ -289,111 +314,104 @@
     }
     init3D();
 
-    function render3D(data) {
+    function render3DCombined() {
       for (let i = scene.children.length - 1; i >= 0; i--) {
         if (scene.children[i].isMesh) scene.remove(scene.children[i]);
       }
       
-      const nodes = {};
-      data.elements.filter(e => e.type === 'node').forEach(n => {
-        nodes[n.id] = [n.lon, n.lat];
-      });
+      const center = [currentBounds.getCenter().lng, currentBounds.getCenter().lat];
 
-      const centerLonLat = getCenter(nodes);
-      
-      data.elements.filter(e => e.type === 'way' && e.tags && e.tags.building).forEach(way => {
-        const coords = way.nodes.map(id => nodes[id]).filter(Boolean);
-        if (coords.length < 3) return;
+      // A. Rendu 3D IGN BD TOPO (Prioritaire si disponible)
+      if (ignData && ignData.features) {
+        ignData.features.forEach(feat => {
+          if (!feat.geometry) return;
+          const height = feat.properties && feat.properties.hauteur ? feat.properties.hauteur : 10;
+          const coords = feat.geometry.coordinates[0];
+          if (!coords || coords.length < 3) return;
 
-        let height = 12;
-        if (way.tags.height) height = parseFloat(way.tags.height);
-        else if (way.tags['building:levels']) height = parseFloat(way.tags['building:levels']) * 3.2;
+          const shape = new THREE.Shape();
+          coords.forEach((c, i) => {
+            const p = lonLatToMeters(c[0], c[1], center);
+            if (i === 0) shape.moveTo(p.x, p.y);
+            else shape.lineTo(p.x, p.y);
+          });
 
-        const shape = new THREE.Shape();
-        coords.forEach((c, i) => {
-          const p = lonLatToMeters(c[0], c[1], centerLonLat);
-          if (i === 0) shape.moveTo(p.x, p.y);
-          else shape.lineTo(p.x, p.y);
+          const geometry = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false });
+          const material = new THREE.MeshStandardMaterial({ color: 0x0099ff, roughness: 0.4 });
+          const mesh = new THREE.Mesh(geometry, material);
+          scene.add(mesh);
         });
+      } 
+      // B. Rendu 3D OSM (Si pas de BD TOPO)
+      else if (osmData) {
+        const nodes = {};
+        osmData.elements.filter(e => e.type === 'node').forEach(n => { nodes[n.id] = [n.lon, n.lat]; });
 
-        const geometry = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false });
-        const material = new THREE.MeshStandardMaterial({ color: 0x0099ff, roughness: 0.4, metalness: 0.1 });
-        const mesh = new THREE.Mesh(geometry, material);
-        scene.add(mesh);
-      });
+        osmData.elements.filter(e => e.type === 'way' && e.tags && e.tags.building).forEach(way => {
+          const coords = way.nodes.map(id => nodes[id]).filter(Boolean);
+          if (coords.length < 3) return;
+
+          let height = way.tags.height ? parseFloat(way.tags.height) : 10;
+          const shape = new THREE.Shape();
+          coords.forEach((c, i) => {
+            const p = lonLatToMeters(c[0], c[1], center);
+            if (i === 0) shape.moveTo(p.x, p.y);
+            else shape.lineTo(p.x, p.y);
+          });
+
+          const geometry = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false });
+          const material = new THREE.MeshStandardMaterial({ color: 0x007acc, roughness: 0.4 });
+          const mesh = new THREE.Mesh(geometry, material);
+          scene.add(mesh);
+        });
+      }
     }
 
-    // --- 4. EXPORTATEUR UNIQUE DXF (COMPATIBLE AUTOCAD 2022) ---
+    // --- 4. EXPORTATEUR DXF UNIFIÉ ---
     document.getElementById('btn-dxf-full').addEventListener('click', () => {
-      let center = [0, 0];
-      const nodes = {};
+      const center = [currentBounds.getCenter().lng, currentBounds.getCenter().lat];
 
-      if (osmData) {
-        osmData.elements.filter(e => e.type === 'node').forEach(n => { nodes[n.id] = [n.lon, n.lat]; });
-        center = getCenter(nodes);
-      } else if (currentBounds) {
-        center = [currentBounds.getCenter().lng, currentBounds.getCenter().lat];
-      }
-
-      // En-tête officiel AutoCAD 2000-2022 ($ACADVER AC1014)
       let dxf = `0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1014\n0\nENDSEC\n`;
+      dxf += `0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLAYER\n70\n6\n`;
       
-      // Calques
-      dxf += `0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLAYER\n70\n5\n`;
       const layers = [
-        { name: "BATIMENTS_2D", color: 5 }, // Bleu
-        { name: "BATIMENTS_3D", color: 1 }, // Rouge
-        { name: "VOIRIE_2D", color: 7 },    // Blanc/Noir
-        { name: "ESPACES_VERTS", color: 3 },// Vert
-        { name: "PARCELLES_CADASTRE", color: 2 } // Jaune
+        { name: "BATIMENTS_IGN_2D", color: 5 },
+        { name: "BATIMENTS_IGN_3D", color: 1 },
+        { name: "BATIMENTS_OSM_2D", color: 4 },
+        { name: "VOIRIE_2D", color: 7 },
+        { name: "PARCELLES_CADASTRE", color: 2 }
       ];
       layers.forEach(l => {
         dxf += `0\nLAYER\n2\n${l.name}\n70\n0\n62\n${l.color}\n6\nCONTINUOUS\n`;
       });
-      dxf += `0\nENDTAB\n0\nENDSEC\n`;
-      
-      dxf += `0\nSECTION\n2\nENTITIES\n`;
+      dxf += `0\nENDTAB\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n`;
 
-      // Traitement OSM (Bâtiments 2D/3D + Voirie + Espaces verts)
-      if (osmData) {
-        osmData.elements.filter(e => e.type === 'way').forEach(way => {
-          const coords = way.nodes.map(id => nodes[id]).filter(Boolean);
-          if (coords.length < 2) return;
+      // 1. Export IGN BD TOPO
+      if (ignData && ignData.features) {
+        ignData.features.forEach(feat => {
+          if (!feat.geometry) return;
+          const height = feat.properties && feat.properties.hauteur ? feat.properties.hauteur : 10;
+          const ring = feat.geometry.coordinates[0];
+          if (!ring) return;
+          
+          const pts = ring.map(c => lonLatToMeters(c[0], c[1], center));
+          
+          // 2D
+          dxf += `0\nLWPOLYLINE\n100\nAcDbEntity\n8\nBATIMENTS_IGN_2D\n100\nAcDbPolyline\n90\n${pts.length}\n70\n1\n`;
+          pts.forEach(p => { dxf += `10\n${p.x.toFixed(3)}\n20\n${p.y.toFixed(3)}\n`; });
 
-          const isBuilding = way.tags && way.tags.building;
-          const pts = coords.map(c => lonLatToMeters(c[0], c[1], center));
-
-          if (isBuilding) {
-            dxf += `0\nLWPOLYLINE\n100\nAcDbEntity\n8\nBATIMENTS_2D\n100\nAcDbPolyline\n90\n${pts.length}\n70\n1\n`;
-            pts.forEach(p => { dxf += `10\n${p.x.toFixed(3)}\n20\n${p.y.toFixed(3)}\n`; });
-
-            let height = 12;
-            if (way.tags.height) height = parseFloat(way.tags.height);
-            else if (way.tags['building:levels']) height = parseFloat(way.tags['building:levels']) * 3.2;
-
-            for (let i = 0; i < pts.length - 1; i++) {
-              const p1 = pts[i], p2 = pts[i+1];
-              dxf += create3DFace(p1.x, p1.y, 0,  p2.x, p2.y, 0,  p2.x, p2.y, height,  p1.x, p1.y, height, "BATIMENTS_3D");
-            }
-            for (let i = 1; i < pts.length - 1; i++) {
-              dxf += create3DFace(pts[0].x, pts[0].y, height,  pts[i].x, pts[i].y, height,  pts[i+1].x, pts[i+1].y, height,  pts[i+1].x, pts[i+1].y, height, "BATIMENTS_3D");
-            }
-          } else {
-            let layerName = "VOIRIE_2D";
-            if (way.tags && (way.tags.landuse === "grass" || way.tags.leisure === "park")) layerName = "ESPACES_VERTS";
-
-            dxf += `0\nLWPOLYLINE\n100\nAcDbEntity\n8\n${layerName}\n100\nAcDbPolyline\n90\n${pts.length}\n70\n0\n`;
-            pts.forEach(p => { dxf += `10\n${p.x.toFixed(3)}\n20\n${p.y.toFixed(3)}\n`; });
+          // 3D
+          for (let i = 0; i < pts.length - 1; i++) {
+            dxf += create3DFace(pts[i].x, pts[i].y, 0, pts[i+1].x, pts[i+1].y, 0, pts[i+1].x, pts[i+1].y, height, pts[i].x, pts[i].y, height, "BATIMENTS_IGN_3D");
           }
         });
       }
 
-      // Traitement Cadastre DGFIP (Limites parcellaires)
+      // 2. Export Cadastre
       if (cadastreData && cadastreData.features) {
         cadastreData.features.forEach(feat => {
           if (!feat.geometry) return;
           const polygons = feat.geometry.type === 'Polygon' ? [feat.geometry.coordinates] : feat.geometry.coordinates;
-
           polygons.forEach(poly => {
             poly.forEach(ring => {
               const pts = ring.map(c => lonLatToMeters(c[0], c[1], center));
@@ -404,25 +422,30 @@
         });
       }
 
+      // 3. Export OSM Voirie
+      if (osmData) {
+        const nodes = {};
+        osmData.elements.filter(e => e.type === 'node').forEach(n => { nodes[n.id] = [n.lon, n.lat]; });
+        osmData.elements.filter(e => e.type === 'way' && e.tags && e.tags.highway).forEach(way => {
+          const coords = way.nodes.map(id => nodes[id]).filter(Boolean);
+          if (coords.length < 2) return;
+          const pts = coords.map(c => lonLatToMeters(c[0], c[1], center));
+          dxf += `0\nLWPOLYLINE\n100\nAcDbEntity\n8\nVOIRIE_2D\n100\nAcDbPolyline\n90\n${pts.length}\n70\n0\n`;
+          pts.forEach(p => { dxf += `10\n${p.x.toFixed(3)}\n20\n${p.y.toFixed(3)}\n`; });
+        });
+      }
+
       dxf += `0\nENDSEC\n0\nEOF\n`;
 
       const blob = new Blob([dxf], { type: 'application/dxf' });
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
-      link.download = `export_projet_2D_3D.dxf`;
+      link.download = `export_grenoble_IGN_CADASTRE.dxf`;
       link.click();
     });
 
     function create3DFace(x1,y1,z1, x2,y2,z2, x3,y3,z3, x4,y4,z4, layer) {
       return `0\n3DFACE\n100\nAcDbEntity\n8\n${layer}\n100\nAcDbFace\n10\n${x1.toFixed(3)}\n20\n${y1.toFixed(3)}\n30\n${z1.toFixed(3)}\n11\n${x2.toFixed(3)}\n21\n${y2.toFixed(3)}\n31\n${z2.toFixed(3)}\n12\n${x3.toFixed(3)}\n22\n${y3.toFixed(3)}\n30\n${z3.toFixed(3)}\n13\n${x4.toFixed(3)}\n23\n${y4.toFixed(3)}\n33\n${z4.toFixed(3)}\n`;
-    }
-
-    // UTILS MATHS & PROJECTION METRIQUE LOCAL
-    function getCenter(nodes) {
-      const keys = Object.keys(nodes);
-      let sumLon = 0, sumLat = 0;
-      keys.forEach(k => { sumLon += nodes[k][0]; sumLat += nodes[k][1]; });
-      return [sumLon / keys.length, sumLat / keys.length];
     }
 
     function lonLatToMeters(lon, lat, center) {
